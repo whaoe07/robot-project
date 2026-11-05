@@ -1,0 +1,207 @@
+"""11_train_act.py
+ACT-lite 训练：图像历史 + qpos 历史 -> 未来 chunk 步动作。
+
+用法（服务器上）：
+    python 11_train_act.py --data /home/lqs/robot-project/data/raw --epochs 60
+"""
+
+import argparse
+import json
+import random
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
+
+from act_model import ACTNet
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--data", default="/home/lqs/robot-project/data/raw")
+    p.add_argument("--runs", default="/home/lqs/robot-project/runs/act")
+    p.add_argument("--epochs", type=int, default=60)
+    p.add_argument("--batch", type=int, default=64)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--chunk", type=int, default=16)
+    p.add_argument("--history", type=int, default=4)
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--device", default="cuda")
+    p.add_argument("--max-episodes", type=int, default=0)
+    p.add_argument("--seed", type=int, default=0)
+    return p.parse_args()
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def compute_stats(files):
+    actions, qpos = [], []
+    for f in files:
+        z = np.load(f)
+        actions.append(z["action"])
+        qpos.append(z["qpos"])
+    a = np.concatenate(actions).astype(np.float32)
+    q = np.concatenate(qpos).astype(np.float32)
+    return {
+        "action_mean": a.mean(0),
+        "action_std": a.std(0) + 1e-6,
+        "qpos_mean": q.mean(0),
+        "qpos_std": q.std(0) + 1e-6,
+    }
+
+
+class EpisodeDataset(Dataset):
+    def __init__(self, files, stats, chunk, history):
+        self.files = files
+        self.stats = stats
+        self.chunk = chunk
+        self.history = history
+        self.index = []
+        self.lengths = []
+        for fi, f in enumerate(files):
+            with np.load(f) as z:
+                T = len(z["images"])
+            self.lengths.append(T)
+            for t in range(T):
+                self.index.append((fi, t))
+        self.cache = {}
+
+    def __len__(self):
+        return len(self.index)
+
+    def _episode(self, fi):
+        if fi not in self.cache:
+            z = np.load(self.files[fi])
+            self.cache[fi] = {
+                "images": z["images"],
+                "qpos": z["qpos"].astype(np.float32),
+                "action": z["action"].astype(np.float32),
+            }
+            if len(self.cache) > 8:
+                self.cache.pop(next(iter(self.cache)))
+        return self.cache[fi]
+
+    def __getitem__(self, i):
+        fi, t = self.index[i]
+        ep = self._episode(fi)
+        T = self.lengths[fi]
+        h = self.history
+
+        t0 = max(0, t - h + 1)
+        imgs = ep["images"][t0 : t + 1]
+        qs = ep["qpos"][t0 : t + 1]
+        if len(imgs) < h:
+            imgs = np.concatenate([np.repeat(imgs[:1], h - len(imgs), axis=0), imgs], axis=0)
+            qs = np.concatenate([np.repeat(qs[:1], h - len(qs), axis=0), qs], axis=0)
+
+        imgs = torch.from_numpy(imgs.astype(np.float32) / 255.0).permute(0, 3, 1, 2)
+        qs = (qs - self.stats["qpos_mean"]) / self.stats["qpos_std"]
+        qs = torch.from_numpy(qs.astype(np.float32).reshape(-1))
+
+        start = min(t + 1, T - 1)
+        acts = ep["action"][start : start + self.chunk]
+        if len(acts) < self.chunk:
+            pad = np.repeat(acts[-1:], self.chunk - len(acts), axis=0)
+            acts = np.concatenate([acts, pad], axis=0)
+        acts = (acts - self.stats["action_mean"]) / self.stats["action_std"]
+        return imgs, qs, torch.from_numpy(acts.astype(np.float32))
+
+
+def main():
+    args = parse_args()
+    set_seed(args.seed)
+
+    files = sorted(Path(args.data).glob("ep_*.npz"))
+    if args.max_episodes:
+        files = files[: args.max_episodes]
+    if len(files) < 2:
+        raise SystemExit(f"数据不足: {args.data}")
+
+    rng = np.random.default_rng(args.seed)
+    order = rng.permutation(len(files))
+    n_val = max(1, int(len(files) * 0.2))
+    val_files = [files[i] for i in order[:n_val]]
+    train_files = [files[i] for i in order[n_val:]]
+
+    stats = compute_stats(train_files)
+    runs = Path(args.runs)
+    runs.mkdir(parents=True, exist_ok=True)
+    np.savez(runs / "norm_stats.npz", **stats)
+    print(f"train {len(train_files)} eps, val {len(val_files)} eps")
+
+    train_ds = EpisodeDataset(train_files, stats, args.chunk, args.history)
+    val_ds = EpisodeDataset(val_files, stats, args.chunk, args.history)
+    print(f"train frames {len(train_ds)}, val frames {len(val_ds)}")
+
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch, shuffle=True,
+        num_workers=args.workers, pin_memory=True, drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=args.batch, shuffle=False,
+        num_workers=max(1, args.workers // 2), pin_memory=True,
+    )
+
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    print("device:", device)
+    model = ACTNet(chunk=args.chunk, history=args.history).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    loss_fn = nn.L1Loss()
+
+    best = float("inf")
+    hist = []
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        total, count = 0.0, 0
+        for imgs, qs, act in train_loader:
+            imgs, qs, act = imgs.to(device), qs.to(device), act.to(device)
+            pred = model(imgs, qs)
+            loss = loss_fn(pred, act)
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            total += loss.item() * len(imgs)
+            count += len(imgs)
+
+        model.eval()
+        val_total, val_count = 0.0, 0
+        with torch.no_grad():
+            for imgs, qs, act in val_loader:
+                imgs, qs, act = imgs.to(device), qs.to(device), act.to(device)
+                val_total += loss_fn(model(imgs, qs), act).item() * len(imgs)
+                val_count += len(imgs)
+
+        train_loss = total / max(count, 1)
+        val_loss = val_total / max(val_count, 1)
+        hist.append({"epoch": epoch, "train": train_loss, "val": val_loss})
+        print(f"epoch {epoch:03d}  train {train_loss:.5f}  val {val_loss:.5f}")
+
+        if val_loss < best:
+            best = val_loss
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "chunk": args.chunk,
+                    "history": args.history,
+                    "stats": {k: v.tolist() for k, v in stats.items()},
+                    "epoch": epoch,
+                    "val_loss": val_loss,
+                },
+                runs / "best.pt",
+            )
+            print("  saved best")
+
+    (runs / "history.json").write_text(json.dumps(hist, indent=2))
+    print(f"done. best val {best:.5f} -> {runs / 'best.pt'}")
+
+
+if __name__ == "__main__":
+    main()
