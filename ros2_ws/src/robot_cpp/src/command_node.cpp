@@ -20,7 +20,7 @@ using namespace std::chrono_literals;
 
 // 目标姿势：7 个手臂关节角 + 1 个夹爪（255 = 张开，0 = 闭合）
 static const std::vector<double> TARGET = {
-    0.0, 0.0, 0.0, -1.0, 0.0, 1.5, -0.78, 255.0};
+    0.0, 0.0, 0.0, -1.5, 0.0, 1.5, -0.78, 255.0};
 
 class CommandNode : public rclcpp::Node {
  public:
