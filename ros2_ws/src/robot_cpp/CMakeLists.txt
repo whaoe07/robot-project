@@ -17,11 +17,16 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 
-# 可执行文件：从 src/command_node.cpp 编译出 command_node
+# ---------- 可执行文件 1：command_node ----------
 add_executable(command_node src/command_node.cpp)
-
-# 链接依赖库
 ament_target_dependencies(command_node
+  rclcpp
+  sensor_msgs
+)
+
+# ---------- 可执行文件 2：latency_node ----------
+add_executable(latency_node src/latency_node.cpp)
+ament_target_dependencies(latency_node
   rclcpp
   sensor_msgs
 )
@@ -29,6 +34,7 @@ ament_target_dependencies(command_node
 # 安装到 lib/robot_cpp，这样 ros2 run 才能找到
 install(TARGETS
   command_node
+  latency_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
