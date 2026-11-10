@@ -12,3 +12,12 @@ ros2_ws/build/
 ros2_ws/install/
 ros2_ws/log/
 models/
+
+# MuJoCo 日志
+MUJOCO_LOG.TXT
+
+# colcon 构建与日志
+log/
+
+# 实验原始日志（体积大，只保留 CSV）
+results/*_raw.txt

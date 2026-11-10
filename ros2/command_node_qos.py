@@ -21,7 +21,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import JointState
 
 CTRL_HZ = 10.0
-TARGET = [0.0, 0.0, 0.0, -1.0, 0.0, 1.5, -0.78, 255.0]
+TARGET = [0.0, 0.0, 0.0, -1.5, 0.0, 1.5, -0.78, 255.0]
 
 
 def parse_args():

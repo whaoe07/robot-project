@@ -1,93 +1,153 @@
-# MuJoCo 机械臂抓取 · 模仿学习（ACT）
+# MuJoCo 抓取系统：ACT 模仿学习 + ROS2 多节点架构
 
-在 MuJoCo 中搭建 Franka 抓取仿真，用脚本化专家采集演示数据，训练 ACT（Action Chunking Transformer）策略，并在随机方块位置下做闭环评估。
+在 MuJoCo 中搭建 Franka 抓取仿真，用脚本化专家采集演示数据，训练 ACT 策略，并改造为 ROS2 多节点系统，用于研究**控制链路延迟**与**泛化性**对抓取性能的影响。
 
 ## 结果
 
-| 指标 | 数值 |
-|---|---|
-| 闭环成功率（50 次随机位置） | **84%（42/50）** |
-| 严格口径（抬升 > 0.5 m） | 52%（26/50） |
-| 基线：单帧 MLP 行为克隆 | 30%（30 次） |
-| 专家（脚本）成功率 | 100% |
+| 实验 | 指标 | 结果 |
+|---|---|---|
+| 静态抓取（单脚本） | 闭环成功率 | 84%（50 次） |
+| 静态抓取（ROS2 闭环） | 闭环成功率 | 84% |
+| 时延影响（0–1000ms） | 成功率 | 100%（无显著影响） |
+| 尺寸泛化（训练 5cm） | 4cm / 5cm / 6cm / 7cm | 60% / 80% / 0% / 0% |
 
-成功定义：一次 episode 结束时，方块仍被夹持在 `final_z > 0.47 m`（初始中心 0.43 m，即抬离桌面 > 4 cm）。严格口径额外要求过程中最高点超过 0.5 m。
+**关键发现**：
 
-## 方法
+- **恒定延迟对准静态抓取几乎无影响**：1000ms + 20% 丢包仍 100% 成功。原因是策略输出目标姿势序列，延迟只让序列整体平移，终态不变。
+- **尺寸零泛化**：训练分布（5cm）之外，6cm 即完全失效（0%）。策略记忆的是针对特定尺寸的动作序列，而非通用抓取技能。
+
+详细数据见 [`docs/experiments.md`](docs/experiments.md)。
+
+## 系统架构
 
 ```
-MuJoCo 场景 (5cm 方块, 随机位置)
-        │
-        ▼
-脚本化专家：IK（阻尼最小二乘） + 路标 + 夹爪时序
-        │  100 条 episode, 20Hz
-        ▼
-数据集：128×128 图像 + 9 维 qpos + 8 维动作
-        │
-        ▼
-ACT-lite：4 帧图像/qpos 历史 → CNN → Transformer
-          → 16 个 query → 16 步动作
-        │
-        ▼
-闭环评估：每 8 步重规划，50 次随机位置
+┌──────────────┐  /joint_states   ┌──────────────┐
+│  sim_node    │  /camera/image   │ policy_node  │
+│  (Python)    │ ────────────────▶│ ACT 推理      │
+│  MuJoCo 20Hz │                  │ (PyTorch)    │
+└──────┬───────┘                  └──────┬───────┘
+       │                                 │ /joint_command
+       │ /joint_command_delayed          │
+       │                                 ▼
+       │                        ┌──────────────────┐
+       └────────────────────────│  latency_node    │
+                                │  (C++/rclcpp)    │
+                                │  延迟/抖动/丢包   │
+                                └──────────────────┘
 ```
 
-关键设计：
+### 节点职责
 
-- **IK**：`Jᵀ(JJᵀ + λI)⁻¹ e`，阻尼最小二乘，λ=1e-3
-- **动作空间**：7 个关节目标角 + 1 个夹爪指令（0–255）
-- **ACT-lite**：简化版 ACT，去掉 VAE，L1 loss，chunk=16，history=4
-- **评估判据**：`final_z > 0.47`（抬离并保持），同时报告严格口径
+| 节点 | 语言 | 职责 |
+|---|---|---|
+| `sim_node` | Python | MuJoCo 物理推进、图像渲染、发布状态 |
+| `policy_node` | Python | ACT 推理，20Hz，exec_k=8 |
+| `latency_node` | **C++** | 时延注入（延迟/抖动/丢包）、端到端延迟统计 |
+| `command_node` | **C++** | 固定目标角发布（测试用） |
+| `teleop_node` | Python | 订阅状态并打印（测试用） |
+
+## 技术栈
+
+- **仿真**：MuJoCo 3.17，MJCF，EGL 离屏渲染
+- **框架**：ROS2 Humble，rclcpp（C++），rclpy（Python）
+- **学习**：PyTorch 2.5.1，ACT-lite（CNN + Transformer encoder/decoder）
+- **算法**：阻尼最小二乘 IK、行为克隆、动作分块
+- **工程**：Linux（WSL2）、colcon/CMake、Git、tmux
 
 ## 复现
 
-环境：Ubuntu 20.04 + RTX 3080 12GB + PyTorch 2.5.1 + MuJoCo 3.17
+### 1. 训练（需要 GPU）
 
 ```bash
-# 1. 采集专家数据（本地 WSL，约 15 分钟）
-python 08_record.py
+python 08_record.py                                    # 采集 100 条演示
+python 11_train_act.py --data data/raw --epochs 60     # 训练 ACT
+python 12_eval_act.py --episodes 50 --exec-k 8         # 闭环评估
+```
 
-# 2. 训练 ACT（服务器，约 20 分钟）
-python 11_train_act.py --data ~/robot-project/data/raw --epochs 60 --batch 64 --device cuda
+### 2. ROS2 系统（CPU 即可）
 
-# 3. 闭环评估（服务器）
-python 12_eval_act.py --episodes 50 --exec-k 8 --device cuda
+```bash
+# 终端 A：仿真
+python3 ros2/sim_node_camera.py --cmd-topic /joint_command_delayed
+
+# 终端 B：策略
+python3 ros2/policy_node.py
+
+# 终端 C：时延节点
+cd ros2_ws && colcon build --packages-select robot_cpp
+source install/setup.bash
+ros2 run robot_cpp latency_node --ros-args -p delay_ms:=200
+```
+
+### 3. 批量实验
+
+```bash
+python3 run_experiment.py 5    # 每组 5 次，自动出汇总表
 ```
 
 ## 目录
 
 ```
 robot-project/
-├── 04_pick_place.py        # 早期：固定路标抓取
-├── 05_jacobian_check.py    # 雅可比数值验证
-├── 07_collect.py           # 抓取流程测试
-├── 08_record.py            # 专家数据采集
-├── act_model.py            # ACT-lite 模型
-├── 11_train_act.py         # 训练
-├── 12_eval_act.py          # 闭环评估
-├── bc_model.py             # 基线：MLP 行为克隆
-├── 09_train_bc.py          # 基线训练
-├── 10_eval.py              # 基线评估
+├── 04_pick_place.py          # 早期：固定路标抓取
+├── 05_jacobian_check.py      # 雅可比数值验证
+├── 08_record.py              # 专家数据采集
+├── 09_train_bc.py            # 基线：MLP 行为克隆
+├── 10_eval.py                # 基线评估
+├── 11_train_act.py           # ACT 训练
+├── 12_eval_act.py            # ACT 评估
+├── act_model.py              # ACT-lite 模型
+├── run_experiment.py         # 批量实验脚本
+├── ros2/                     # Python 节点
+│   ├── sim_node_camera.py
+│   ├── policy_node.py
+│   ├── command_node.py
+│   └── teleop_node.py
+├── ros2_ws/src/robot_cpp/    # C++ 节点
+│   ├── src/command_node.cpp
+│   └── src/latency_node.cpp
 ├── docs/
-│   ├── glossary.md         # 知识树笔记
-│   ├── pipeline.md         # 全流程框架
-│   └── jobs.md             # 岗位地图
-└── data/raw/               # 100 条专家数据
+│   ├── experiments.md        # 实验记录（含失败案例）
+│   ├── pipeline.md           # 全流程框架
+│   ├── glossary.md           # 知识树笔记
+│   └── retrospective.md      # 项目复盘
+└── data/raw/                 # 100 条专家数据
 ```
 
-## 失败分析
+## 关键设计
 
-- 主要失败集中在工作空间边缘（x < 0.48 或 x > 0.64）：机械臂接近伸展，关节误差放大
-- 部分失败是抬升高度差 1–7 mm（严格口径下判失败，实际已抓离桌面）
-- `exec_k=16`（一次执行 0.8 s）显著变差，说明闭环重规划频率很重要
+**IK（专家）**
 
-## 局限与后续
+```python
+dq = J.T @ np.linalg.solve(J @ J.T + damp * np.eye(6), e)
+```
+
+阻尼最小二乘，λ=1e-3，防止奇异位形处关节速度爆炸。
+
+**ACT-lite**
+
+```
+4 帧图像 + 4 帧 qpos
+  → CNN（保留 4×4 空间特征）
+  → Transformer Encoder（时序建模）
+  → 16 个可学习 query → Transformer Decoder
+  → 16 步动作
+```
+
+**评估判据**
+
+- 成功：结束时方块仍被夹持在 `初始高度 + 4cm` 以上
+- 同时报告 `max_z`（过程最高点）和 `min_z_after_grasp`（抓住后最低点），识别"抬起来又掉"
+
+## 局限
 
 - 仅仿真，未做 sim2real
+- 尺寸泛化零容忍（6cm 即失效）
+- 恒定延迟对准静态任务无影响（需要动态任务才能测出延迟敏感性）
 - 未使用时序集成（temporal ensemble）
-- 时延鲁棒性实验（通信背景的差异化方向）尚未开展
 
 ## 参考
 
 - Zhao et al., *Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware* (ACT), RSS 2023
 - MuJoCo Menagerie: https://github.com/google-deepmind/mujoco_menagerie
+- ROS2 Humble: https://docs.ros.org/en/humble/

@@ -21,6 +21,7 @@
 
 import argparse
 import os
+from pathlib import Path
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 
@@ -33,12 +34,48 @@ XML = os.path.expanduser("~/mujoco_menagerie/franka_emika_panda/scene_pick.xml")
 IMG_H, IMG_W = 128, 128
 
 
+def make_scene_with_size(size_cm):
+    """按方块边长生成一个临时 XML。
+
+    为什么不直接改 model.geom_size：
+      MuJoCo 的几何尺寸是编译期参数，运行时改会让惯性/碰撞不一致，
+      方块会被挤飞（实测 max_z 出现 1000+ 的异常值）。
+    """
+    half = size_cm / 200.0                 # cm → m → 半边长
+    mass = 0.05 * (size_cm / 5.0) ** 3     # 体积等比缩放
+    z = 0.4 + half                         # 贴桌面
+
+    src = Path(XML).read_text(encoding="utf-8")
+    dst = src.replace(
+        'size="0.025 0.025 0.025"',
+        f'size="{half:.6f} {half:.6f} {half:.6f}"',
+    ).replace(
+        'mass="0.05"',
+        f'mass="{mass:.6f}"',
+    ).replace(
+        '<body name="cube" pos="0.55 0 0.43">',
+        f'<body name="cube" pos="0.55 0 {z:.6f}">',
+    )
+
+    out_path = Path(XML).parent / f"scene_pick_s{size_cm:g}.xml"
+    out_path.write_text(dst, encoding="utf-8")
+    return str(out_path), half, mass
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--hz", type=float, default=20.0)
+    p.add_argument("--log-every", type=int, default=20,
+                   help="每多少个 tick 打印一次日志（20Hz 下 20 = 1 秒）")
     p.add_argument("--cmd-topic", default="/joint_command")
     p.add_argument("--cube-x", type=float, default=None, help="方块 x（默认 0.55）")
     p.add_argument("--cube-y", type=float, default=None, help="方块 y（默认 0）")
+    p.add_argument("--cube-vel-x", type=float, default=0.0,
+                   help="方块 x 方向速度 m/s（模拟传送带）")
+    p.add_argument("--cube-vel-y", type=float, default=0.0,
+                   help="方块 y 方向速度 m/s")
+    p.add_argument("--cube-size", type=float, default=None,
+                   help="方块边长（厘米），默认用 XML 里的 5cm")
     return p.parse_args()
 
 
@@ -47,11 +84,20 @@ class SimNodeCamera(Node):
         super().__init__("sim_node")
 
         # ---------- MuJoCo ----------
-        self.model = mujoco.MjModel.from_xml_path(XML)
+        self.cube_half = 0.025
+        xml_path = XML
+        if args.cube_size is not None:
+            xml_path, self.cube_half, mass = make_scene_with_size(args.cube_size)
+            self.get_logger().info(
+                f"cube size {args.cube_size}cm -> {xml_path} "
+                f"(half={self.cube_half:.4f}, mass={mass:.4f}kg)"
+            )
+
+        self.model = mujoco.MjModel.from_xml_path(xml_path)
         self.data = mujoco.MjData(self.model)
         mujoco.mj_resetDataKeyframe(self.model, self.data, 0)
 
-        # 可选：指定方块位置（qpos[9], qpos[10]）
+        # 可选：指定方块位置（qpos[9]=x, qpos[10]=y）
         if args.cube_x is not None:
             self.data.qpos[9] = args.cube_x
         if args.cube_y is not None:
@@ -63,6 +109,11 @@ class SimNodeCamera(Node):
 
         self.hz = args.hz
         self.steps_per_tick = int(round((1.0 / self.hz) / self.model.opt.timestep))
+
+        # 方块速度（传送带）：每物理步强制设置，抵消摩擦减速
+        self.cube_vel_x = args.cube_vel_x
+        self.cube_vel_y = args.cube_vel_y
+        self.conveyor = (self.cube_vel_x != 0.0 or self.cube_vel_y != 0.0)
 
         # ---------- 相机 ----------
         self.cam = mujoco.MjvCamera()
@@ -88,6 +139,7 @@ class SimNodeCamera(Node):
 
         self.tick_count = 0
         self.cmd_count = 0
+        self.log_every = args.log_every
 
     def on_command(self, msg):
         n = min(len(msg.position), self.model.nu)
@@ -95,8 +147,11 @@ class SimNodeCamera(Node):
         self.cmd_count += 1
 
     def tick(self):
-        # 1. 推进物理
+        # 1. 推进物理（传送带模式下每步强制设置方块速度）
         for _ in range(self.steps_per_tick):
+            if self.conveyor:
+                self.data.qvel[9] = self.cube_vel_x   # 线速度 x
+                self.data.qvel[10] = self.cube_vel_y  # 线速度 y
             mujoco.mj_step(self.model, self.data)
 
         stamp = self.get_clock().now().to_msg()
@@ -126,11 +181,12 @@ class SimNodeCamera(Node):
 
         # 4. 日志
         self.tick_count += 1
-        if self.tick_count % 40 == 0:
+        if self.tick_count % self.log_every == 0:
             hand = self.data.xpos[self.hand_id]
             cube = self.data.xpos[self.cube_id]
             self.get_logger().info(
                 f"t={self.data.time:.1f}s hand_z={hand[2]:.2f} "
+                f"cube_x={cube[0]:.3f} cube_y={cube[1]:+.3f} "
                 f"cube_z={cube[2]:.3f} cmds={self.cmd_count}"
             )
 
